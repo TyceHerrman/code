@@ -1,0 +1,11 @@
+[features.network_proxy.domains]
+"bcr.bazel.build" = "allow"
+"chromium.googlesource.com" = "allow"
+"codeload.github.com" = "allow"
+"files.pythonhosted.org" = "allow"
+"github.com" = "allow"
+"index.crates.io" = "allow"
+"release-assets.githubusercontent.com" = "allow"
+"releases.bazel.build" = "allow"
+"static.crates.io" = "allow"
+"swcdn.apple.com" = "allow"

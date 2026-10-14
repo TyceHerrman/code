@@ -41,6 +41,9 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
+    /// Exact source-state + output hashes mapped to the original tool call.
+    /// Entries are used only while that call remains present in active history.
+    pub(crate) codex_zero_exact_tool_results: HashMap<String, String>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
 }
@@ -73,6 +76,7 @@ impl SessionState {
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
+            codex_zero_exact_tool_results: HashMap::new(),
             granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
         }

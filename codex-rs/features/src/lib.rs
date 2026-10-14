@@ -102,6 +102,16 @@ pub enum Feature {
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
+    /// Emit a strictly smaller structured model payload for unified exec results.
+    CodexZeroCompactExecOutput,
+    /// Apply a reversible, strictly smaller terminal codec to model-visible output.
+    CodexZeroLosslessTerminalCodec,
+    /// Project successful check output into an artifact-backed diagnostic summary.
+    CodexZeroCommandAwareProjection,
+    /// Replace a proven unchanged duplicate tool result with a smaller active-context reference.
+    CodexZeroExactDuplicateResults,
+    /// Keep empty background-process polls local until output, exit, cancellation, or hard timeout.
+    CodexZeroEventDrivenWait,
     /// Route shell tool execution through the zsh exec bridge.
     ShellZshFork,
     /// Allow unified exec to compose with the zsh exec bridge.
@@ -858,6 +868,36 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "unified_exec",
         stage: Stage::Stable,
         default_enabled: !cfg!(windows),
+    },
+    FeatureSpec {
+        id: Feature::CodexZeroCompactExecOutput,
+        key: "codex_zero_compact_exec_output",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CodexZeroLosslessTerminalCodec,
+        key: "codex_zero_lossless_terminal_codec",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CodexZeroCommandAwareProjection,
+        key: "codex_zero_command_aware_projection",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CodexZeroExactDuplicateResults,
+        key: "codex_zero_exact_duplicate_results",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CodexZeroEventDrivenWait,
+        key: "codex_zero_event_driven_wait",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ShellZshFork,

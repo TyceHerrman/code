@@ -82,7 +82,7 @@ impl ToolCallRuntime {
         let future = self.handle_tool_call_with_source(call, source, cancellation_token);
         async move {
             match future.await {
-                Ok(response) => Ok(response.into_response()),
+                Ok(response) => Ok(response.into_response().await),
                 Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
                 Err(other) => Ok(Self::failure_response(error_call, other)),
             }
@@ -252,6 +252,9 @@ impl ToolCallRuntime {
                 message: Self::abort_message(call, secs),
             }),
             post_tool_use_payload: None,
+            session: None,
+            exact_source_fingerprint: None,
+            exact_duplicate_results_enabled: false,
         }
     }
 

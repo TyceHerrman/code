@@ -33,6 +33,7 @@ members = [
     "connectors",
     "config",
     "context-fragments",
+    "codex-zero-codec",
     "shell-command",
     "shell-escalation",
     "skills",
@@ -193,6 +194,7 @@ codex-image-generation-extension = { path = "ext/image-generation" }
 codex-external-agent-migration = { path = "external-agent-migration" }
 codex-experimental-api-macros = { path = "codex-experimental-api-macros" }
 codex-features = { path = "features" }
+codex-zero-codec = { path = "codex-zero-codec" }
 codex-feedback = { path = "feedback" }
 codex-install-context = { path = "install-context" }
 codex-file-search = { path = "file-search" }
@@ -405,6 +407,7 @@ scopeguard = "1.2.0"
 sha2 = "0.10"
 shlex = "1.3.0"
 similar = "2.7.0"
+tiktoken-rs = "0.12.0"
 symphonia = { version = "0.6.0", default-features = false, features = [
     "isomp4",
     "mkv",

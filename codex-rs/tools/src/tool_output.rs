@@ -24,6 +24,23 @@ pub trait ToolOutput: Send {
         false
     }
 
+    /// Returns deterministic model-output bytes eligible for exact duplicate detection.
+    ///
+    /// Implementations must exclude volatile execution metadata while retaining
+    /// every byte needed to prove that the referenced output content is equal.
+    fn exact_duplicate_key(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Builds a lossless reference to equal output already active in model context.
+    fn exact_duplicate_reference(
+        &self,
+        _previous_call_id: &str,
+        _source_state_sha256: &str,
+    ) -> Option<String> {
+        None
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
 
     /// Returns the tool call id exposed to `PostToolUse` hooks for this output.
@@ -66,6 +83,18 @@ where
 
     fn contains_external_context(&self) -> bool {
         (**self).contains_external_context()
+    }
+
+    fn exact_duplicate_key(&self) -> Option<Vec<u8>> {
+        (**self).exact_duplicate_key()
+    }
+
+    fn exact_duplicate_reference(
+        &self,
+        previous_call_id: &str,
+        source_state_sha256: &str,
+    ) -> Option<String> {
+        (**self).exact_duplicate_reference(previous_call_id, source_state_sha256)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

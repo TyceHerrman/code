@@ -436,6 +436,9 @@ fn exec_command_tool_output_formats_truncated_response() {
         original_token_count: Some(10),
         output_omitted_bytes: None,
         hook_command: None,
+        compact_model_payload: false,
+        lossless_terminal_codec: false,
+        command_aware_projection: false,
     }
     .to_response_item("call-42", &payload);
 
@@ -487,6 +490,9 @@ fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
         original_token_count: Some(42_000),
         output_omitted_bytes: NonZeroUsize::new(/*n*/ 123_456),
         hook_command: None,
+        compact_model_payload: false,
+        lossless_terminal_codec: false,
+        command_aware_projection: false,
     }
     .to_response_item("call-omitted", &payload);
 
@@ -500,4 +506,158 @@ fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
     assert!(text.contains("Original token count: 42000"));
     assert!(text.contains("Warning: truncated output (original token count: 42000)"));
     assert_eq!(text.matches(&marker).count(), 1);
+}
+
+#[test]
+fn codex_zero_exec_payload_is_selected_only_when_strictly_smaller() {
+    let temp = tempfile::tempdir().expect("temporary artifact directory");
+    let telemetry_path = temp.path().join("telemetry.jsonl");
+    let raw_output = "same diagnostic line\n".repeat(400).into_bytes();
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-zero".to_string(),
+        chunk_id: "zero123".to_string(),
+        wall_time: std::time::Duration::from_millis(1250),
+        raw_output: raw_output.clone(),
+        truncation_policy: TruncationPolicy::Tokens(100_000),
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: Some(0),
+        original_token_count: Some(1600),
+        output_omitted_bytes: None,
+        hook_command: Some("ignored model command".to_string()),
+        compact_model_payload: true,
+        lossless_terminal_codec: true,
+        command_aware_projection: true,
+    };
+
+    let original = output.response_text();
+    let selected =
+        output.model_response_text_with_paths(original.clone(), temp.path(), Some(&telemetry_path));
+
+    assert!(codex_zero_codec::token_count(&selected) < codex_zero_codec::token_count(&original));
+    assert!(!selected.contains("Output:"));
+    assert!(!selected.contains("ignored model command"));
+    let payload: serde_json::Value =
+        serde_json::from_str(&selected).expect("compact payload should be JSON");
+    let sha = payload["artifact"]["sha256"]
+        .as_str()
+        .expect("artifact hash");
+    assert_eq!(
+        std::fs::read(temp.path().join("sha256").join(sha)).expect("raw artifact"),
+        raw_output
+    );
+    let telemetry = std::fs::read_to_string(telemetry_path).expect("telemetry record");
+    assert!(telemetry.contains(r#""transformed":true"#));
+}
+
+#[test]
+fn codex_zero_exec_payload_falls_back_when_candidate_is_not_smaller() {
+    let temp = tempfile::tempdir().expect("temporary artifact directory");
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-zero-small".to_string(),
+        chunk_id: String::new(),
+        wall_time: std::time::Duration::ZERO,
+        raw_output: Vec::new(),
+        truncation_policy: TruncationPolicy::Tokens(100),
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: None,
+        original_token_count: None,
+        output_omitted_bytes: None,
+        hook_command: None,
+        compact_model_payload: true,
+        lossless_terminal_codec: true,
+        command_aware_projection: true,
+    };
+
+    let original = output.response_text();
+    assert_eq!(
+        output.model_response_text_with_paths(original.clone(), temp.path(), None),
+        original
+    );
+}
+
+#[test]
+fn codex_zero_exact_duplicate_key_uses_full_raw_output() {
+    let prefix = "same prefix\n".repeat(200);
+    let suffix = "same suffix\n".repeat(200);
+    let make_output = |middle: &str| ExecCommandToolOutput {
+        event_call_id: "call-exact".to_string(),
+        chunk_id: "exact123".to_string(),
+        wall_time: std::time::Duration::ZERO,
+        raw_output: format!("{prefix}{middle}{suffix}").into_bytes(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(32),
+        process_id: None,
+        exit_code: Some(0),
+        original_token_count: None,
+        output_omitted_bytes: None,
+        hook_command: None,
+        compact_model_payload: false,
+        lossless_terminal_codec: false,
+        command_aware_projection: false,
+    };
+    let first = make_output("hidden value 1\n");
+    let second = make_output("hidden value 2\n");
+
+    assert_eq!(
+        first.truncated_output(first.model_output_max_tokens()),
+        second.truncated_output(second.model_output_max_tokens())
+    );
+    assert_ne!(first.exact_duplicate_key(), second.exact_duplicate_key());
+}
+
+#[test]
+fn codex_zero_successful_check_projection_is_artifact_backed_and_recorded() {
+    let temp = tempfile::tempdir().expect("temporary artifact directory");
+    let telemetry_path = temp.path().join("telemetry.jsonl");
+    let mut raw_output = String::from("test suite\nplatform windows\nstarting\n");
+    for index in 0..140 {
+        raw_output.push_str(&format!(
+            "completed fixture {index} with value {}\n",
+            index * 17
+        ));
+    }
+    raw_output.push_str("warning: deprecated fixture\nsrc/check.js:10\n");
+    raw_output.push_str("Tests: 140 passed, 140 total\n");
+    let raw_output = raw_output.into_bytes();
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-projection".to_string(),
+        chunk_id: "projection123".to_string(),
+        wall_time: std::time::Duration::from_millis(1250),
+        raw_output: raw_output.clone(),
+        truncation_policy: TruncationPolicy::Tokens(100_000),
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: Some(0),
+        original_token_count: Some(2000),
+        output_omitted_bytes: None,
+        hook_command: Some("npm test".to_string()),
+        compact_model_payload: true,
+        lossless_terminal_codec: true,
+        command_aware_projection: true,
+    };
+
+    let selected = output.model_response_text_with_paths(
+        output.response_text(),
+        temp.path(),
+        Some(&telemetry_path),
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&selected).expect("compact payload should be JSON");
+    assert_eq!(payload["projection"], "successful-check-v1");
+    assert_eq!(payload["original_line_count"], 146);
+    assert!(payload["output"].as_str().is_some_and(|text| {
+        text.contains("warning: deprecated fixture")
+            && text.contains("Tests: 140 passed, 140 total")
+    }));
+    let sha = payload["artifact"]["sha256"]
+        .as_str()
+        .expect("artifact hash");
+    assert_eq!(
+        std::fs::read(temp.path().join("sha256").join(sha)).expect("raw artifact"),
+        raw_output
+    );
+    let telemetry = std::fs::read_to_string(telemetry_path).expect("telemetry record");
+    assert!(telemetry.contains(r#""projection":"successful-check-v1""#));
 }

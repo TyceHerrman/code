@@ -9,6 +9,7 @@ use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
 use crate::unified_exec::WriteStdinInteractionEvent;
 use crate::unified_exec::WriteStdinRequest;
+use codex_features::Feature;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -83,6 +84,22 @@ impl WriteStdinHandler {
                     session: &session,
                     turn: &turn,
                 }),
+                compact_model_payload: turn
+                    .config
+                    .features
+                    .enabled(Feature::CodexZeroCompactExecOutput),
+                lossless_terminal_codec: turn
+                    .config
+                    .features
+                    .enabled(Feature::CodexZeroLosslessTerminalCodec),
+                command_aware_projection: turn
+                    .config
+                    .features
+                    .enabled(Feature::CodexZeroCommandAwareProjection),
+                event_driven_wait: turn
+                    .config
+                    .features
+                    .enabled(Feature::CodexZeroEventDrivenWait),
             })
             .await
             .map_err(|err| {

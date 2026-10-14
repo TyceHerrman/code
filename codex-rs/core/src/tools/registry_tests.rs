@@ -319,8 +319,8 @@ async fn write_stdin_does_not_expose_default_pre_tool_use_payload() {
     assert_eq!(write_stdin.pre_tool_use_payload(&invocation), None);
 }
 
-#[test]
-fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
+#[tokio::test]
+async fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
     let result = AnyToolResult {
         call_id: "call-1".to_string(),
         payload: ToolPayload::Function {
@@ -336,10 +336,13 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
             ),
         }),
         post_tool_use_payload: None,
+        session: None,
+        exact_source_fingerprint: None,
+        exact_duplicate_results_enabled: false,
     };
 
     assert_eq!(
-        result.into_response(),
+        result.into_response().await,
         ResponseInputItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
             output: codex_protocol::models::FunctionCallOutputPayload::from_text(
@@ -363,11 +366,209 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
             ),
         }),
         post_tool_use_payload: None,
+        session: None,
+        exact_source_fingerprint: None,
+        exact_duplicate_results_enabled: false,
     };
 
     assert_eq!(
         result.code_mode_result(),
         serde_json::json!({ "typed": true })
+    );
+}
+
+#[tokio::test]
+async fn exact_duplicate_result_references_only_an_active_identical_output() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let text = "unchanged source line\n".repeat(200);
+    let source_fingerprint = "a".repeat(64);
+    let first = AnyToolResult {
+        call_id: "read-1".to_string(),
+        payload: payload.clone(),
+        result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
+            text.clone(),
+            Some(true),
+        )),
+        post_tool_use_payload: None,
+        session: Some(Arc::clone(&session)),
+        exact_source_fingerprint: Some(source_fingerprint.clone()),
+        exact_duplicate_results_enabled: true,
+    }
+    .into_response()
+    .await;
+    let first_history_item = codex_protocol::models::ResponseItem::from(first);
+    session
+        .record_conversation_items(&turn, &[first_history_item])
+        .await;
+
+    let second = AnyToolResult {
+        call_id: "read-2".to_string(),
+        payload,
+        result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
+            text.clone(),
+            Some(true),
+        )),
+        post_tool_use_payload: None,
+        session: Some(session),
+        exact_source_fingerprint: Some(source_fingerprint.clone()),
+        exact_duplicate_results_enabled: true,
+    }
+    .into_response()
+    .await;
+
+    let ResponseInputItem::FunctionCallOutput { output, .. } = second else {
+        panic!("expected function output");
+    };
+    let codex_protocol::models::FunctionCallOutputBody::Text(selected) = output.body else {
+        panic!("expected text output");
+    };
+    assert!(codex_zero_codec::token_count(&selected) < codex_zero_codec::token_count(&text));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&selected).expect("duplicate reference JSON"),
+        serde_json::json!({
+            "same_as_tool_call": "read-1",
+            "source_state_sha256": source_fingerprint,
+        })
+    );
+}
+
+#[tokio::test]
+async fn disabled_exact_duplicate_does_not_capture_runtime_state() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let handler = TestHandler {
+        tool_name: codex_tools::ToolName::plain("test"),
+    };
+    let invocation = test_invocation(
+        Arc::clone(&session),
+        Arc::new(turn),
+        "call-disabled",
+        handler.tool_name.clone(),
+    );
+
+    let result = handle_any_tool(&handler, invocation)
+        .await
+        .expect("disabled exact-duplicate tool result");
+
+    assert!(result.session.is_none());
+    assert_eq!(result.exact_source_fingerprint, None);
+    assert!(!result.exact_duplicate_results_enabled);
+}
+
+#[tokio::test]
+async fn exact_source_fingerprints_change_with_file_and_repository_state() {
+    let temp = tempfile::tempdir().expect("temporary repository");
+    let file = temp.path().join("fixture.txt");
+    tokio::fs::write(&file, b"first")
+        .await
+        .expect("write fixture");
+    let read = ParsedCommand::Read {
+        cmd: "cat fixture.txt".to_string(),
+        name: "cat".to_string(),
+        path: std::path::PathBuf::from("fixture.txt"),
+    };
+    let first = crate::tools::exact_duplicate::file_source_fingerprint(
+        std::slice::from_ref(&read),
+        temp.path(),
+    )
+    .await
+    .expect("file fingerprint");
+    let unchanged = crate::tools::exact_duplicate::file_source_fingerprint(
+        std::slice::from_ref(&read),
+        temp.path(),
+    )
+    .await
+    .expect("unchanged file fingerprint");
+    assert_eq!(first, unchanged);
+    tokio::fs::write(&file, b"second")
+        .await
+        .expect("change fixture");
+    let changed = crate::tools::exact_duplicate::file_source_fingerprint(&[read], temp.path())
+        .await
+        .expect("changed file fingerprint");
+    assert_ne!(first, changed);
+
+    let status = tokio::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(temp.path())
+        .status()
+        .await
+        .expect("run git init");
+    assert!(status.success());
+    let first_repo = crate::tools::exact_duplicate::repository_state_fingerprint(temp.path())
+        .await
+        .expect("repository fingerprint");
+    let unchanged_repo = crate::tools::exact_duplicate::repository_state_fingerprint(temp.path())
+        .await
+        .expect("unchanged repository fingerprint");
+    assert_eq!(first_repo, unchanged_repo);
+    tokio::fs::write(&file, b"third")
+        .await
+        .expect("change repository file");
+    let changed_repo = crate::tools::exact_duplicate::repository_state_fingerprint(temp.path())
+        .await
+        .expect("changed repository fingerprint");
+    assert_ne!(first_repo, changed_repo);
+
+    let search = ParsedCommand::Search {
+        cmd: "rg third .".to_string(),
+        query: Some("third".to_string()),
+        path: Some(".".to_string()),
+    };
+    let first_search = crate::tools::exact_duplicate::repository_search_fingerprint(
+        std::slice::from_ref(&search),
+        temp.path(),
+    )
+    .await
+    .expect("search fingerprint");
+    let unchanged_search = crate::tools::exact_duplicate::repository_search_fingerprint(
+        std::slice::from_ref(&search),
+        temp.path(),
+    )
+    .await
+    .expect("unchanged search fingerprint");
+    assert_eq!(first_search, unchanged_search);
+    tokio::fs::write(&file, b"fourth")
+        .await
+        .expect("change searched file");
+    let changed_search =
+        crate::tools::exact_duplicate::repository_search_fingerprint(&[search], temp.path())
+            .await
+            .expect("changed search fingerprint");
+    assert_ne!(first_search, changed_search);
+
+    let hidden_search = ParsedCommand::Search {
+        cmd: "rg --hidden fourth .".to_string(),
+        query: Some("fourth".to_string()),
+        path: Some(".".to_string()),
+    };
+    assert_eq!(
+        crate::tools::exact_duplicate::repository_search_fingerprint(
+            &[hidden_search],
+            temp.path(),
+        )
+        .await,
+        None
+    );
+
+    let outside = tempfile::tempdir().expect("outside search directory");
+    let outside_path = outside.path().display().to_string();
+    let outside_search = ParsedCommand::Search {
+        cmd: format!("rg fourth {outside_path}"),
+        query: Some("fourth".to_string()),
+        path: Some(outside_path),
+    };
+    assert_eq!(
+        crate::tools::exact_duplicate::repository_search_fingerprint(
+            &[outside_search],
+            temp.path(),
+        )
+        .await,
+        None
     );
 }
 

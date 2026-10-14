@@ -486,6 +486,21 @@
             "codex_hooks": {
               "type": "boolean"
             },
+            "codex_zero_command_aware_projection": {
+              "type": "boolean"
+            },
+            "codex_zero_compact_exec_output": {
+              "type": "boolean"
+            },
+            "codex_zero_event_driven_wait": {
+              "type": "boolean"
+            },
+            "codex_zero_exact_duplicate_results": {
+              "type": "boolean"
+            },
+            "codex_zero_lossless_terminal_codec": {
+              "type": "boolean"
+            },
             "collab": {
               "type": "boolean"
             },
@@ -5044,6 +5059,21 @@
           "type": "boolean"
         },
         "codex_hooks": {
+          "type": "boolean"
+        },
+        "codex_zero_command_aware_projection": {
+          "type": "boolean"
+        },
+        "codex_zero_compact_exec_output": {
+          "type": "boolean"
+        },
+        "codex_zero_event_driven_wait": {
+          "type": "boolean"
+        },
+        "codex_zero_exact_duplicate_results": {
+          "type": "boolean"
+        },
+        "codex_zero_lossless_terminal_codec": {
           "type": "boolean"
         },
         "collab": {

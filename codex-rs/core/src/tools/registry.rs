@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::function_tool::FunctionCallError;
 use crate::hook_runtime::PreToolUseHookResult;
@@ -19,6 +21,7 @@ use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::exact_duplicate;
 use crate::tools::flat_tool_name;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::hook_names::HookToolName;
@@ -172,17 +175,76 @@ pub(crate) struct AnyToolResult {
     pub(crate) payload: ToolPayload,
     pub(crate) result: Box<dyn ToolOutput>,
     pub(crate) post_tool_use_payload: Option<PostToolUsePayload>,
+    pub(crate) session: Option<Arc<crate::session::session::Session>>,
+    pub(crate) exact_source_fingerprint: Option<String>,
+    pub(crate) exact_duplicate_results_enabled: bool,
 }
 
 impl AnyToolResult {
-    pub(crate) fn into_response(self) -> ResponseInputItem {
+    pub(crate) async fn into_response(self) -> ResponseInputItem {
         let Self {
             call_id,
             payload,
             result,
+            session,
+            exact_source_fingerprint,
+            exact_duplicate_results_enabled,
             ..
         } = self;
-        result.to_response_item(&call_id, &payload)
+        let mut response = result.to_response_item(&call_id, &payload);
+        if !exact_duplicate_results_enabled {
+            return response;
+        }
+        let (Some(session), Some(source_fingerprint)) = (session, exact_source_fingerprint) else {
+            return response;
+        };
+        let ResponseInputItem::FunctionCallOutput { output, .. } = &mut response else {
+            return response;
+        };
+        let codex_protocol::models::FunctionCallOutputBody::Text(original_text) = &mut output.body
+        else {
+            return response;
+        };
+        let Some(duplicate_key) = result.exact_duplicate_key() else {
+            return response;
+        };
+
+        let mut result_key = Vec::with_capacity(source_fingerprint.len() + duplicate_key.len() + 1);
+        result_key.extend_from_slice(source_fingerprint.as_bytes());
+        result_key.push(0);
+        result_key.extend_from_slice(&duplicate_key);
+        let result_key = codex_zero_codec::sha256(&result_key);
+        let active_call = session
+            .codex_zero_active_duplicate_call(result_key, call_id.clone())
+            .await;
+
+        if let Some(previous_call_id) = active_call {
+            let Some(candidate) =
+                result.exact_duplicate_reference(&previous_call_id, &source_fingerprint)
+            else {
+                return response;
+            };
+            let selection = codex_zero_codec::select_strictly_smaller(original_text, candidate);
+            if selection.transformed {
+                let timestamp_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or_default();
+                let _ = codex_zero_codec::append_telemetry(&serde_json::json!({
+                    "schema": "codex-zero-telemetry-v1",
+                    "event": "exact_duplicate_result",
+                    "timestamp_ms": timestamp_ms,
+                    "source_state_sha256": source_fingerprint,
+                    "original_tokens": selection.original_tokens,
+                    "selected_tokens": selection.selected_tokens,
+                    "tokens_eliminated": selection.original_tokens.saturating_sub(selection.selected_tokens),
+                    "transformed": true,
+                }));
+                *original_text = selection.text;
+                return response;
+            }
+        }
+        response
     }
 
     pub(crate) fn code_mode_result(self) -> serde_json::Value {
@@ -754,11 +816,27 @@ async fn handle_any_tool(
     }
     let post_tool_use_payload =
         CoreToolRuntime::post_tool_use_payload(tool, &invocation, output.as_ref());
+    let exact_duplicate_results_enabled = invocation
+        .turn
+        .config
+        .features
+        .enabled(codex_features::Feature::CodexZeroExactDuplicateResults);
+    let (session, exact_source_fingerprint) = if exact_duplicate_results_enabled {
+        (
+            Some(Arc::clone(&invocation.session)),
+            exact_duplicate::source_fingerprint(&invocation).await,
+        )
+    } else {
+        (None, None)
+    };
     Ok(AnyToolResult {
         call_id,
         payload,
         result: output,
         post_tool_use_payload,
+        session,
+        exact_source_fingerprint,
+        exact_duplicate_results_enabled,
     })
 }
 

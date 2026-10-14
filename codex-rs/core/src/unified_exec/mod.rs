@@ -117,6 +117,10 @@ pub(crate) struct WriteStdinRequest<'a> {
     pub max_output_tokens: Option<usize>,
     pub truncation_policy: TruncationPolicy,
     pub interaction_event: Option<WriteStdinInteractionEvent<'a>>,
+    pub compact_model_payload: bool,
+    pub lossless_terminal_codec: bool,
+    pub command_aware_projection: bool,
+    pub event_driven_wait: bool,
 }
 
 pub(crate) struct WriteStdinInteractionEvent<'a> {

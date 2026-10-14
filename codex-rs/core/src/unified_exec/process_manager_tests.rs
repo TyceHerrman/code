@@ -271,7 +271,7 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
         &output_closed_notify,
         &cancellation_token,
         /*pause_state*/ None,
-        Instant::now() + Duration::from_secs(5),
+        OutputCollectionMode::UntilDeadline(Instant::now() + Duration::from_secs(5)),
     );
     let produce = async {
         for byte in [b'a', b'b', b'c'] {
@@ -309,6 +309,37 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
 }
 
 #[tokio::test]
+async fn output_collection_can_return_on_first_output() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+
+    let collect = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        /*pause_state*/ None,
+        OutputCollectionMode::UntilOutput(Instant::now() + Duration::from_secs(1)),
+    );
+    let produce = async {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        output_buffer.lock().await.push_chunk(b"ready".to_vec());
+        output_notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        output_buffer.lock().await.push_chunk(b"later".to_vec());
+        output_notify.notify_one();
+    };
+
+    let (collected, ()) = tokio::join!(collect, produce);
+    assert_eq!(collected.to_bytes(), b"ready");
+    assert_eq!(output_buffer.lock().await.to_bytes(), b"later");
+}
+
+#[tokio::test]
 async fn output_collection_preserves_omissions_from_drained_buffer() {
     let mut buffered_output = HeadTailBuffer::default();
     buffered_output.push_chunk(vec![
@@ -336,7 +367,7 @@ async fn output_collection_preserves_omissions_from_drained_buffer() {
         &output_closed_notify,
         &cancellation_token,
         /*pause_state*/ None,
-        Instant::now() + Duration::from_secs(1),
+        OutputCollectionMode::UntilDeadline(Instant::now() + Duration::from_secs(1)),
     )
     .await;
 

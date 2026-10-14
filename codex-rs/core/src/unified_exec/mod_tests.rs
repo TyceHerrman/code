@@ -11,6 +11,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::process::OutputHandles;
+use crate::unified_exec::process_manager::OutputCollectionMode;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
@@ -165,7 +166,7 @@ async fn exec_command_with_tty(
         &output_closed_notify,
         &cancellation_token,
         Some(session.subscribe_elicitation_pause_state()),
-        deadline,
+        OutputCollectionMode::UntilDeadline(deadline),
     )
     .await;
     let wall_time = Instant::now().saturating_duration_since(started_at);
@@ -208,6 +209,9 @@ async fn exec_command_with_tty(
         original_token_count: Some(original_token_count),
         output_omitted_bytes,
         hook_command: Some(cmd.to_string()),
+        compact_model_payload: false,
+        lossless_terminal_codec: false,
+        command_aware_projection: false,
     })
 }
 
@@ -325,6 +329,10 @@ async fn write_stdin(
             max_output_tokens: None,
             truncation_policy: TruncationPolicy::Tokens(10_000),
             interaction_event: None,
+            compact_model_payload: false,
+            lossless_terminal_codec: false,
+            command_aware_projection: false,
+            event_driven_wait: false,
         })
         .await
 }
@@ -822,7 +830,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
         &output_closed_notify,
         &cancellation_token,
         /*pause_state*/ None,
-        Instant::now() + Duration::from_millis(2_500),
+        OutputCollectionMode::UntilDeadline(Instant::now() + Duration::from_millis(2_500)),
     )
     .await
     .to_bytes_with_omission_marker();

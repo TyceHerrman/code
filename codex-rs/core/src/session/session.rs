@@ -491,6 +491,38 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    pub(crate) async fn codex_zero_active_duplicate_call(
+        &self,
+        result_key: String,
+        current_call_id: String,
+    ) -> Option<String> {
+        let mut state = self.state.lock().await;
+        let active_call_ids = state
+            .history
+            .raw_items()
+            .iter()
+            .filter_map(|item| match item {
+                codex_protocol::models::ResponseItem::FunctionCallOutput { call_id, .. } => {
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        state
+            .codex_zero_exact_tool_results
+            .retain(|_, call_id| active_call_ids.contains(call_id));
+        let active_call = state
+            .codex_zero_exact_tool_results
+            .get(&result_key)
+            .cloned();
+        if active_call.is_none() {
+            state
+                .codex_zero_exact_tool_results
+                .insert(result_key, current_call_id);
+        }
+        active_call
+    }
+
     #[instrument(name = "session_init", level = "info", skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(

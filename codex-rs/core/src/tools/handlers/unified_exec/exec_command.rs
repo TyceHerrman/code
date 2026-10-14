@@ -337,6 +337,18 @@ impl ExecCommandHandler {
                 original_token_count: None,
                 output_omitted_bytes: None,
                 hook_command: None,
+                compact_model_payload: turn
+                    .config
+                    .features
+                    .enabled(Feature::CodexZeroCompactExecOutput),
+                lossless_terminal_codec: turn
+                    .config
+                    .features
+                    .enabled(Feature::CodexZeroLosslessTerminalCodec),
+                command_aware_projection: turn
+                    .config
+                    .features
+                    .enabled(Feature::CodexZeroCommandAwareProjection),
             }));
         }
 
@@ -391,6 +403,18 @@ impl ExecCommandHandler {
                     original_token_count: Some(original_token_count),
                     output_omitted_bytes,
                     hook_command: Some(hook_command),
+                    compact_model_payload: turn
+                        .config
+                        .features
+                        .enabled(Feature::CodexZeroCompactExecOutput),
+                    lossless_terminal_codec: turn
+                        .config
+                        .features
+                        .enabled(Feature::CodexZeroLosslessTerminalCodec),
+                    command_aware_projection: turn
+                        .config
+                        .features
+                        .enabled(Feature::CodexZeroCommandAwareProjection),
                 }))
             }
             Err(err) => Err(FunctionCallError::RespondToModel(format!(

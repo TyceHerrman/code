@@ -1,3 +1,4 @@
+use crate::config::find_codex_home;
 use crate::context_manager::truncate_function_output_payload;
 use crate::original_image_detail::sanitize_original_image_detail;
 use crate::session::session::Session;
@@ -22,11 +23,19 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::truncate_text;
 use codex_utils_string::take_bytes_at_char_boundary;
+use codex_zero_codec::append_telemetry_to_path;
+use codex_zero_codec::encode_command_output;
+use codex_zero_codec::select_strictly_smaller;
+use codex_zero_codec::store_raw;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::num::NonZeroUsize;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -231,6 +240,22 @@ impl ToolOutput for FunctionToolOutput {
         self.success.unwrap_or(true)
     }
 
+    fn exact_duplicate_key(&self) -> Option<Vec<u8>> {
+        function_call_output_content_items_to_text(&self.body).map(String::into_bytes)
+    }
+
+    fn exact_duplicate_reference(
+        &self,
+        previous_call_id: &str,
+        source_state_sha256: &str,
+    ) -> Option<String> {
+        serde_json::to_string(&serde_json::json!({
+            "same_as_tool_call": previous_call_id,
+            "source_state_sha256": source_state_sha256,
+        }))
+        .ok()
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         function_tool_response(call_id, payload, self.body.clone(), self.success)
     }
@@ -327,6 +352,9 @@ pub struct ExecCommandToolOutput {
     /// Bytes omitted by the output collection cap before model-facing truncation.
     pub output_omitted_bytes: Option<NonZeroUsize>,
     pub hook_command: Option<String>,
+    pub compact_model_payload: bool,
+    pub lossless_terminal_codec: bool,
+    pub command_aware_projection: bool,
 }
 
 impl ToolOutput for ExecCommandToolOutput {
@@ -338,12 +366,55 @@ impl ToolOutput for ExecCommandToolOutput {
         true
     }
 
+    fn exact_duplicate_key(&self) -> Option<Vec<u8>> {
+        Some(self.raw_output.clone())
+    }
+
+    fn exact_duplicate_reference(
+        &self,
+        previous_call_id: &str,
+        source_state_sha256: &str,
+    ) -> Option<String> {
+        #[derive(Serialize)]
+        struct DuplicateExecOutput<'a> {
+            #[serde(skip_serializing_if = "str::is_empty")]
+            chunk_id: &'a str,
+            wall_time_seconds: f64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            exit_code: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            process_id: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            original_token_count: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            output_omitted_bytes: Option<usize>,
+            raw_sha256: String,
+            raw_byte_count: usize,
+            same_output_as_tool_call: &'a str,
+            source_state_sha256: &'a str,
+        }
+
+        serde_json::to_string(&DuplicateExecOutput {
+            chunk_id: &self.chunk_id,
+            wall_time_seconds: self.wall_time.as_secs_f64(),
+            exit_code: self.exit_code,
+            process_id: self.process_id,
+            original_token_count: self.original_token_count,
+            output_omitted_bytes: self.output_omitted_bytes.map(NonZeroUsize::get),
+            raw_sha256: codex_zero_codec::sha256(&self.raw_output),
+            raw_byte_count: self.raw_output.len(),
+            same_output_as_tool_call: previous_call_id,
+            source_state_sha256,
+        })
+        .ok()
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         function_tool_response(
             call_id,
             payload,
             vec![FunctionCallOutputContentItem::InputText {
-                text: self.response_text(),
+                text: self.model_response_text(),
             }],
             Some(true),
         )
@@ -468,6 +539,175 @@ impl ExecCommandToolOutput {
 
         sections.join("\n")
     }
+
+    fn model_response_text(&self) -> String {
+        let original = self.response_text();
+        if !self.compact_model_payload
+            && !self.lossless_terminal_codec
+            && !self.command_aware_projection
+        {
+            return original;
+        }
+
+        let artifact_root = std::env::var_os("CODEX_ZERO_ARTIFACT_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                find_codex_home()
+                    .ok()
+                    .map(|codex_home| codex_zero_default_artifact_root(codex_home.as_path()))
+            });
+        let Some(artifact_root) = artifact_root else {
+            return original;
+        };
+        let telemetry_path = std::env::var_os("CODEX_ZERO_TELEMETRY_FILE")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        self.model_response_text_with_paths(original, &artifact_root, telemetry_path.as_deref())
+    }
+
+    fn model_response_text_with_paths(
+        &self,
+        original: String,
+        artifact_root: &std::path::Path,
+        telemetry_path: Option<&std::path::Path>,
+    ) -> String {
+        let artifact = match store_raw(artifact_root, &self.raw_output) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    artifact_root = %artifact_root.display(),
+                    "failed to preserve raw CodexZero output; returning stock output"
+                );
+                return original;
+            }
+        };
+
+        let truncated = self.truncated_output(self.model_output_max_tokens());
+        let terminal = if self.command_aware_projection {
+            encode_command_output(
+                truncated.as_bytes(),
+                self.hook_command.as_deref(),
+                self.exit_code,
+            )
+        } else if self.lossless_terminal_codec {
+            codex_zero_codec::encode_terminal(truncated.as_bytes())
+        } else {
+            codex_zero_codec::TerminalEncoding {
+                text: truncated,
+                codec: None,
+                projection: None,
+                original_line_count: None,
+                presentation_changed: false,
+            }
+        };
+
+        #[derive(Serialize)]
+        struct ArtifactMetadata<'a> {
+            sha256: &'a str,
+            raw_byte_count: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            original_token_count: Option<usize>,
+        }
+
+        #[derive(Serialize)]
+        struct CompactExecOutput<'a> {
+            #[serde(skip_serializing_if = "str::is_empty")]
+            chunk_id: &'a str,
+            wall_time_seconds: f64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            exit_code: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            process_id: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            original_token_count: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            output_omitted_bytes: Option<usize>,
+            artifact: ArtifactMetadata<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            codec: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            projection: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            original_line_count: Option<usize>,
+            #[serde(skip_serializing_if = "is_false")]
+            presentation_styling_removed: bool,
+            #[serde(skip_serializing_if = "str::is_empty")]
+            output: &'a str,
+        }
+
+        let candidate = CompactExecOutput {
+            chunk_id: &self.chunk_id,
+            wall_time_seconds: self.wall_time.as_secs_f64(),
+            exit_code: self.exit_code,
+            process_id: self.process_id,
+            original_token_count: self.original_token_count,
+            output_omitted_bytes: self.output_omitted_bytes.map(NonZeroUsize::get),
+            artifact: ArtifactMetadata {
+                sha256: &artifact.sha256,
+                raw_byte_count: artifact.byte_count,
+                original_token_count: self.original_token_count,
+            },
+            codec: terminal.codec,
+            projection: terminal.projection,
+            original_line_count: terminal.original_line_count,
+            presentation_styling_removed: terminal.presentation_changed,
+            output: &terminal.text,
+        };
+        let Ok(candidate) = serde_json::to_string(&candidate) else {
+            return original;
+        };
+        let selection = select_strictly_smaller(&original, candidate);
+        self.record_codex_zero_selection(
+            telemetry_path,
+            &artifact.sha256,
+            terminal.codec,
+            terminal.projection,
+            &selection,
+        );
+        selection.text
+    }
+
+    fn record_codex_zero_selection(
+        &self,
+        telemetry_path: Option<&std::path::Path>,
+        artifact_sha256: &str,
+        codec: Option<&str>,
+        projection: Option<&str>,
+        selection: &codex_zero_codec::MonotonicSelection,
+    ) {
+        let Some(path) = telemetry_path else {
+            return;
+        };
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let record = serde_json::json!({
+            "schema": "codex-zero-telemetry-v1",
+            "event": "exec_model_payload",
+            "timestamp_ms": timestamp_ms,
+            "artifact_sha256": artifact_sha256,
+            "raw_byte_count": self.raw_output.len(),
+            "original_tokens": selection.original_tokens,
+            "selected_tokens": selection.selected_tokens,
+            "tokens_eliminated": selection.original_tokens.saturating_sub(selection.selected_tokens),
+            "transformed": selection.transformed,
+            "codec": codec,
+            "projection": projection,
+        });
+        let _ = append_telemetry_to_path(path, &record);
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn codex_zero_default_artifact_root(codex_home: &Path) -> PathBuf {
+    codex_home.join("codexzero").join("artifacts")
 }
 
 fn function_tool_response(

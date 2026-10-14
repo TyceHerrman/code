@@ -90,6 +90,12 @@ const NETWORK_ACCESS_DENIED_MESSAGE: &str =
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
 const INTERRUPT: &str = "\u{3}";
 
+#[derive(Clone, Copy)]
+pub(super) enum OutputCollectionMode {
+    UntilDeadline(Instant),
+    UntilOutput(Instant),
+}
+
 /// Test-only override for deterministic unified exec process IDs.
 ///
 /// In production builds this value should remain at its default (`false`) and
@@ -517,7 +523,7 @@ impl UnifiedExecProcessManager {
             &output_closed_notify,
             &cancellation_token,
             Some(context.session.subscribe_elicitation_pause_state()),
-            deadline,
+            OutputCollectionMode::UntilDeadline(deadline),
         )
         .await;
         let wall_time = Instant::now().saturating_duration_since(start);
@@ -674,6 +680,21 @@ impl UnifiedExecProcessManager {
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
             hook_command: Some(request.hook_command.clone()),
+            compact_model_payload: context
+                .turn
+                .config
+                .features
+                .enabled(codex_features::Feature::CodexZeroCompactExecOutput),
+            lossless_terminal_codec: context
+                .turn
+                .config
+                .features
+                .enabled(codex_features::Feature::CodexZeroLosslessTerminalCodec),
+            command_aware_projection: context
+                .turn
+                .config
+                .features
+                .enabled(codex_features::Feature::CodexZeroCommandAwareProjection),
         };
 
         Ok(response)
@@ -751,11 +772,15 @@ impl UnifiedExecProcessManager {
         let yield_time_ms = {
             // Empty polls use configurable background timeout bounds. Non-empty
             // writes keep a fixed max cap so interactive stdin remains responsive.
-            let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
-            if request.input.is_empty() {
-                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
+            if request.input.is_empty() && request.event_driven_wait {
+                self.max_write_stdin_yield_time_ms
             } else {
-                time_ms.min(MAX_YIELD_TIME_MS)
+                let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
+                if request.input.is_empty() {
+                    time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
+                } else {
+                    time_ms.min(MAX_YIELD_TIME_MS)
+                }
             }
         };
         let start = Instant::now();
@@ -767,7 +792,11 @@ impl UnifiedExecProcessManager {
             &output_closed_notify,
             &cancellation_token,
             pause_state,
-            deadline,
+            if request.input.is_empty() && request.event_driven_wait {
+                OutputCollectionMode::UntilOutput(deadline)
+            } else {
+                OutputCollectionMode::UntilDeadline(deadline)
+            },
         )
         .await;
         let wall_time = Instant::now().saturating_duration_since(start);
@@ -849,6 +878,9 @@ impl UnifiedExecProcessManager {
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
             hook_command: Some(hook_command),
+            compact_model_payload: request.compact_model_payload,
+            lossless_terminal_codec: request.lossless_terminal_codec,
+            command_aware_projection: request.command_aware_projection,
         };
 
         let should_emit_interaction = !request.input.is_empty() || response.process_id.is_some();
@@ -1270,9 +1302,13 @@ impl UnifiedExecProcessManager {
         output_closed_notify: &Arc<Notify>,
         cancellation_token: &CancellationToken,
         mut pause_state: Option<watch::Receiver<bool>>,
-        mut deadline: Instant,
+        mode: OutputCollectionMode,
     ) -> HeadTailBuffer {
         const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
+        let (mut deadline, return_on_output) = match mode {
+            OutputCollectionMode::UntilDeadline(deadline) => (deadline, false),
+            OutputCollectionMode::UntilOutput(deadline) => (deadline, true),
+        };
 
         let mut collected = HeadTailBuffer::default();
         let mut exit_signal_received = cancellation_token.is_cancelled();
@@ -1344,6 +1380,9 @@ impl UnifiedExecProcessManager {
 
             collected.push_buffer(drained_output);
 
+            if return_on_output {
+                break;
+            }
             exit_signal_received |= cancellation_token.is_cancelled();
             if Instant::now() >= deadline {
                 break;

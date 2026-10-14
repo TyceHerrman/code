@@ -1404,6 +1404,99 @@ async fn unified_exec_emits_one_begin_and_one_end_event() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_driven_empty_poll_waits_past_requested_interval_until_silent_exit() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::CodexZeroEventDrivenWait)
+            .expect("test config should allow feature update");
+        config.background_terminal_max_timeout = 10_000;
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let open_call_id = "event-driven-silent-open";
+    let poll_call_id = "event-driven-silent-poll";
+    let silent_command = if cfg!(windows) {
+        "Start-Sleep -Seconds 6"
+    } else {
+        "sleep 6"
+    };
+    let open_args = json!({
+        "cmd": silent_command,
+        "yield_time_ms": 100,
+    });
+    let poll_args = json!({
+        "chars": "",
+        "session_id": 1000,
+        "yield_time_ms": 100,
+    });
+    let responses = vec![
+        sse(vec![
+            ev_response_created("event-driven-resp-1"),
+            ev_function_call(
+                open_call_id,
+                "exec_command",
+                &serde_json::to_string(&open_args)?,
+            ),
+            ev_completed("event-driven-resp-1"),
+        ]),
+        sse(vec![
+            ev_response_created("event-driven-resp-2"),
+            ev_function_call(
+                poll_call_id,
+                "write_stdin",
+                &serde_json::to_string(&poll_args)?,
+            ),
+            ev_completed("event-driven-resp-2"),
+        ]),
+        sse(vec![
+            ev_response_created("event-driven-resp-3"),
+            ev_assistant_message("event-driven-msg", "done"),
+            ev_completed("event-driven-resp-3"),
+        ]),
+    ];
+    let request_log = mount_sse_sequence(&server, responses).await;
+
+    let started_at = std::time::Instant::now();
+    submit_unified_exec_turn(
+        &test,
+        "wait for the silent process",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert!(
+        started_at.elapsed() >= Duration::from_millis(5_500),
+        "empty poll returned at its five-second compatibility floor instead of waiting for exit"
+    );
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let poll_output = requests
+        .iter()
+        .find_map(|request| request.function_call_output_text(poll_call_id))
+        .expect("poll output");
+    let parsed = parse_unified_exec_output(&poll_output)?;
+    assert_eq!(parsed.process_id, None);
+    assert_eq!(parsed.exit_code, Some(0));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_command_reports_chunk_and_exit_metadata() -> Result<()> {
     // TODO(anp): Remove after unified-exec fixtures use target-native commands.
     skip_if_target_windows!(Ok(()), "uses a POSIX-only command fixture");
@@ -1492,6 +1585,168 @@ async fn exec_command_reports_chunk_and_exit_metadata() -> Result<()> {
     assert!(
         original_tokens > 6,
         "original token count should exceed max_output_tokens"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_duplicate_repository_search_uses_active_result_reference() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::CodexZeroExactDuplicateResults)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let fixture = "needle diagnostic\n".repeat(200);
+    let fixture_path = test.config.cwd.join("fixture.txt");
+    let fixture_uri = PathUri::from_host_native_path(&fixture_path)?;
+    test.fs()
+        .write_file(&fixture_uri, fixture.into_bytes(), /*sandbox*/ None)
+        .await?;
+
+    let setup_call_id = "duplicate-search-setup";
+    let first_search_call_id = "duplicate-search-first";
+    let second_search_call_id = "duplicate-search-second";
+    let setup_args = json!({
+        "cmd": "git init --quiet; git add fixture.txt",
+        "yield_time_ms": 5_000,
+    });
+    let search_args = json!({
+        "cmd": "git grep needle fixture.txt",
+        "yield_time_ms": 5_000,
+    });
+    let responses = vec![
+        sse(vec![
+            ev_response_created("duplicate-search-resp-1"),
+            ev_function_call(
+                setup_call_id,
+                "exec_command",
+                &serde_json::to_string(&setup_args)?,
+            ),
+            ev_completed("duplicate-search-resp-1"),
+        ]),
+        sse(vec![
+            ev_response_created("duplicate-search-resp-2"),
+            ev_function_call(
+                first_search_call_id,
+                "exec_command",
+                &serde_json::to_string(&search_args)?,
+            ),
+            ev_completed("duplicate-search-resp-2"),
+        ]),
+        sse(vec![
+            ev_response_created("duplicate-search-resp-3"),
+            ev_function_call(
+                second_search_call_id,
+                "exec_command",
+                &serde_json::to_string(&search_args)?,
+            ),
+            ev_completed("duplicate-search-resp-3"),
+        ]),
+        sse(vec![
+            ev_assistant_message("duplicate-search-msg", "done"),
+            ev_completed("duplicate-search-resp-4"),
+        ]),
+    ];
+    let request_log = mount_sse_sequence(&server, responses).await;
+
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "run the same repository search twice".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments: Some(local_selections(test.config.cwd.clone())),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await?;
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let requests = request_log.requests();
+    let original = requests
+        .iter()
+        .find_map(|request| request.function_call_output_text(first_search_call_id))
+        .expect("first search output");
+    assert!(original.contains("needle diagnostic"));
+
+    let selected = requests
+        .iter()
+        .find_map(|request| request.function_call_output_text(second_search_call_id))
+        .expect("second search output");
+    let selected: Value = serde_json::from_str(&selected)
+        .with_context(|| format!("second search was not replaced: {selected:?}"))?;
+    let source_state_sha256 = selected
+        .get("source_state_sha256")
+        .and_then(Value::as_str)
+        .expect("source state hash");
+    assert_eq!(source_state_sha256.len(), 64);
+    let chunk_id = selected
+        .get("chunk_id")
+        .and_then(Value::as_str)
+        .expect("chunk id");
+    let wall_time_seconds = selected
+        .get("wall_time_seconds")
+        .and_then(Value::as_f64)
+        .expect("wall time");
+    let original_token_count = selected
+        .get("original_token_count")
+        .and_then(Value::as_u64)
+        .expect("original token count");
+    let raw_sha256 = selected
+        .get("raw_sha256")
+        .and_then(Value::as_str)
+        .expect("raw output hash");
+    assert_eq!(raw_sha256.len(), 64);
+    let raw_byte_count = selected
+        .get("raw_byte_count")
+        .and_then(Value::as_u64)
+        .expect("raw byte count");
+    assert_eq!(
+        selected,
+        json!({
+            "chunk_id": chunk_id,
+            "wall_time_seconds": wall_time_seconds,
+            "exit_code": 0,
+            "original_token_count": original_token_count,
+            "raw_sha256": raw_sha256,
+            "raw_byte_count": raw_byte_count,
+            "same_output_as_tool_call": first_search_call_id,
+            "source_state_sha256": source_state_sha256,
+        })
     );
 
     Ok(())
